@@ -203,94 +203,88 @@ def _strip_shape(shape):
 
 def normalize_webm(raw: bytes) -> bytes:
     """
-    Normalize WEBM agar memenuhi spec emoji Telegram:
-    - Resize ke 100×100 (contain + pad transparan)
-    - Strip audio
-    - Cap 30 FPS
-    - Trim ke max 3 detik
-    - Encode VP9 lossless-ish (CRF rendah, kualitas tinggi)
-    - Output < 256KB
-    
-    Pakai ffmpeg — tidak ada penurunan kualitas visual signifikan.
+    Normalize WEBM agar memenuhi spec emoji Telegram (< 256KB, 100x100, 30fps, 3s, no audio).
+    Pakai 2-pass encoding untuk kontrol ukuran file yang ketat.
     """
     with tempfile.TemporaryDirectory() as tmp:
-        inp = Path(tmp) / "input.webm"
-        out = Path(tmp) / "output.webm"
+        inp  = Path(tmp) / "input.webm"
+        out  = Path(tmp) / "output.webm"
+        log2 = Path(tmp) / "ffmpeg2pass"
         inp.write_bytes(raw)
 
-        # Pass 1: coba kualitas tinggi dulu (CRF 10 = hampir lossless VP9)
-        cmd = [
-            "ffmpeg", "-y",
+        vf = (
+            f"scale={EMOJI_SIZE}:{EMOJI_SIZE}:"
+            f"force_original_aspect_ratio=decrease,"
+            f"pad={EMOJI_SIZE}:{EMOJI_SIZE}:(ow-iw)/2:(oh-ih)/2,"
+            f"setsar=1,fps={WEBM_MAX_FPS}"
+        )
+        base_args = [
             "-i", str(inp),
-            "-vf", (
-                f"scale={EMOJI_SIZE}:{EMOJI_SIZE}:"
-                f"force_original_aspect_ratio=decrease,"
-                f"pad={EMOJI_SIZE}:{EMOJI_SIZE}:(ow-iw)/2:(oh-ih)/2:color=0x00000000,"
-                f"setsar=1"
-            ),
+            "-vf", vf,
             "-c:v", "libvpx-vp9",
-            "-b:v", "0",
-            "-crf", "10",            # kualitas tinggi
             "-r", str(WEBM_MAX_FPS),
             "-t", str(WEBM_MAX_DURATION),
-            "-an",                   # hapus audio
-            "-pix_fmt", "yuva420p",  # preserve alpha
-            "-auto-alt-ref", "0",    # required for alpha
-            str(out)
+            "-an",
         ]
 
-        result = subprocess.run(cmd, capture_output=True, timeout=60)
-        if result.returncode != 0:
-            # Fallback: tanpa alpha channel (lebih kompatibel)
-            cmd2 = [
-                "ffmpeg", "-y",
-                "-i", str(inp),
-                "-vf", (
-                    f"scale={EMOJI_SIZE}:{EMOJI_SIZE}:"
-                    f"force_original_aspect_ratio=decrease,"
-                    f"pad={EMOJI_SIZE}:{EMOJI_SIZE}:(ow-iw)/2:(oh-ih)/2,"
-                    f"setsar=1"
-                ),
-                "-c:v", "libvpx-vp9",
-                "-b:v", "0", "-crf", "15",
-                "-r", str(WEBM_MAX_FPS),
-                "-t", str(WEBM_MAX_DURATION),
-                "-an",
-                str(out)
+        def run_ffmpeg(extra_args, outfile):
+            cmd = ["ffmpeg", "-y"] + base_args + extra_args + [str(outfile)]
+            r = subprocess.run(cmd, capture_output=True, timeout=90)
+            return r.returncode == 0
+
+        # Coba dari kualitas tertinggi, turun bertahap sampai < 256KB
+        attempts = [
+            # (crf, bitrate_target, bitrate_max)
+            (18,  "150k", "200k"),
+            (24,  "100k", "150k"),
+            (30,   "70k", "100k"),
+            (36,   "50k",  "80k"),
+            (42,   "35k",  "60k"),
+        ]
+
+        result_bytes = None
+        for crf, bv, maxrate in attempts:
+            # 2-pass encode untuk kontrol ukuran paling akurat
+            # Pass 1
+            p1 = [
+                "-b:v", bv, "-maxrate", maxrate, "-bufsize", maxrate,
+                "-crf", str(crf),
+                "-pass", "1", "-passlogfile", str(log2),
+                "-f", "null",
             ]
-            result2 = subprocess.run(cmd2, capture_output=True, timeout=60)
-            if result2.returncode != 0:
-                raise RuntimeError(f"ffmpeg gagal: {result2.stderr.decode()[-300:]}")
+            run_ffmpeg(p1, "/dev/null")
 
-        output_bytes = out.read_bytes()
-        size_kb = len(output_bytes) / 1024
-
-        # Kalau masih > 256KB, naikkan CRF (kurangi bitrate)
-        if size_kb > WEBM_MAX_KB:
-            cmd_compress = [
-                "ffmpeg", "-y",
-                "-i", str(inp),
-                "-vf", (
-                    f"scale={EMOJI_SIZE}:{EMOJI_SIZE}:"
-                    f"force_original_aspect_ratio=decrease,"
-                    f"pad={EMOJI_SIZE}:{EMOJI_SIZE}:(ow-iw)/2:(oh-ih)/2,"
-                    f"setsar=1"
-                ),
-                "-c:v", "libvpx-vp9",
-                "-b:v", "200k",       # target bitrate
-                "-maxrate", "300k",
-                "-bufsize", "400k",
-                "-r", str(WEBM_MAX_FPS),
-                "-t", str(WEBM_MAX_DURATION),
-                "-an",
-                str(out)
+            # Pass 2
+            p2 = [
+                "-b:v", bv, "-maxrate", maxrate, "-bufsize", maxrate,
+                "-crf", str(crf),
+                "-pass", "2", "-passlogfile", str(log2),
             ]
-            subprocess.run(cmd_compress, capture_output=True, timeout=60)
-            output_bytes = out.read_bytes()
-            size_kb = len(output_bytes) / 1024
+            ok = run_ffmpeg(p2, out)
 
-        log.info(f"WEBM normalized: {len(raw)/1024:.1f}KB → {size_kb:.1f}KB")
-        return output_bytes
+            if ok and out.exists():
+                size_kb = out.stat().st_size / 1024
+                log.info(f"WEBM attempt crf={crf}: {size_kb:.1f}KB")
+                if size_kb <= WEBM_MAX_KB:
+                    result_bytes = out.read_bytes()
+                    log.info(f"WEBM normalized: {len(raw)/1024:.1f}KB → {size_kb:.1f}KB (crf={crf})")
+                    break
+
+        # Fallback: kalau semua attempt masih > 256KB, ambil hasil terkecil
+        if result_bytes is None:
+            if out.exists():
+                result_bytes = out.read_bytes()
+                size_kb = len(result_bytes) / 1024
+                log.warning(f"WEBM masih {size_kb:.1f}KB setelah semua attempt, upload anyway")
+            else:
+                # Last resort: single pass CRF 50
+                run_ffmpeg(["-crf", "50", "-b:v", "0"], out)
+                if out.exists():
+                    result_bytes = out.read_bytes()
+                else:
+                    raise RuntimeError("ffmpeg gagal di semua attempt")
+
+        return result_bytes
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -576,90 +570,4 @@ async def cmd_convert(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await bot.add_sticker_to_set(
                     user_id=user.id,
                     name=out_name,
-                    sticker=InputSticker(
-                        sticker=up.file_id,
-                        emoji_list=[st.emoji or "⭐"],
-                        format=out_fmt,
-                    ),
-                )
-                uploaded += 1
-            except Exception as e:
-                log.warning(f"Stiker #{start_from+i+1} dilewati: {e}")
-                skipped += 1
-
-            await asyncio.sleep(UPLOAD_DELAY)
-
-        # ── Selesai ──────────────────────────────────────────────────────────
-        out_url = f"https://t.me/addemoji/{out_name}"
-        src_url = f"https://t.me/addstickers/{pack_name}"
-
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("💎 Buka Emoji Pack", url=out_url)],
-            [InlineKeyboardButton("📦 Lihat Pack Sumber", url=src_url)],
-        ])
-
-        skip_line = f"⚠️ Dilewati: *{skipped} stiker*\n" if skipped else ""
-        await msg.edit_text(
-            f"✅ *Konversi selesai\\!*\n\n"
-            f"📦 Sumber: [{md_escape(pack.title)}]({src_url})\n"
-            f"💎 Output: `{md_escape(out_name)}`\n"
-            f"📊 Format: {md_escape(fmt_label)}\n\n"
-            f"✔️ Berhasil: *{uploaded} emoji*\n"
-            f"{skip_line}"
-            f"\n👇 Tap tombol untuk membuka emoji pack\\.",
-            parse_mode="MarkdownV2",
-            reply_markup=keyboard,
-        )
-
-    except Exception as e:
-        log.exception("Unexpected error in /convert")
-        await status(f"❌ Error tidak terduga:\n`{e}`")
-
-
-def normalize_sticker(raw: bytes, fmt: str) -> tuple[bytes, str]:
-    """
-    Normalize stiker sesuai format dan kembalikan (bytes, format_string).
-    Dijalankan di thread executor agar tidak block event loop.
-    """
-    if fmt == "static":
-        return normalize_static(raw), "static"
-    elif fmt == "animated":
-        try:
-            return normalize_tgs(raw), "animated"
-        except Exception as e:
-            log.warning(f"TGS normalize gagal ({e}), upload as-is")
-            return raw, "animated"
-    elif fmt == "video":
-        try:
-            return normalize_webm(raw), "video"
-        except Exception as e:
-            log.warning(f"WEBM normalize gagal ({e}), upload as-is")
-            return raw, "video"
-    return raw, fmt
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# MAIN
-# ════════════════════════════════════════════════════════════════════════════
-
-def main():
-    if not BOT_TOKEN:
-        print("=" * 50)
-        print("❌  BOT_TOKEN belum di-set!")
-        print()
-        print("Railway : tab Variables → BOT_TOKEN = <token>")
-        print("Lokal   : export BOT_TOKEN=<token>")
-        print("=" * 50)
-        return
-
-    log.info("Craving Emojis Bot starting...")
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start",   cmd_start))
-    app.add_handler(CommandHandler("help",    cmd_help))
-    app.add_handler(CommandHandler("convert", cmd_convert))
-    log.info("Bot aktif! Kirim /start di Telegram.")
-    app.run_polling(drop_pending_updates=True)
-
-
-if __name__ == "__main__":
-    main()
+                    sticker=Inp
